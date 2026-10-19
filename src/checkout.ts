@@ -1,7 +1,7 @@
 import { normalizeCode, type CouponService } from './coupons.js';
 import { AppError } from './errors.js';
 import { lineTotal, percentOf, sum, type Cents } from './money.js';
-import type { PaymentGateway } from './payment.js';
+import type { ChargeResult, PaymentGateway } from './payment.js';
 import type { Store } from './store.js';
 import type { Cart, Coupon, Order, OrderDiscount, OrderLine } from './types.js';
 
@@ -34,9 +34,23 @@ interface Reservation {
   totalCents: Cents;
 }
 
+/**
+ * in_progress      -> an attempt is running; retries join its promise
+ * payment_unknown  -> the provider could not confirm the charge; the
+ *                     reservation stays held until a retry or the
+ *                     maintenance pass learns the outcome
+ * completed        -> replay the order until `expiresAt`
+ * Failed attempts have no record, so the key can be reused after a fix.
+ */
 type IdempotencyRecord =
   | { state: 'in_progress'; fingerprint: string; promise: Promise<Order> }
-  | { state: 'completed'; fingerprint: string; orderId: string };
+  | { state: 'payment_unknown'; fingerprint: string; reservation: Reservation }
+  | { state: 'completed'; fingerprint: string; orderId: string; expiresAt: number };
+
+/** What the provider told us about a charge, including "we don't know". */
+type ChargeOutcome = ChargeResult | { status: 'not_charged' } | { status: 'unknown' };
+
+export const DEFAULT_IDEMPOTENCY_TTL_MS = 24 * 60 * 60 * 1000;
 
 /**
  * Checkout = reserve (sync) -> charge (async) -> commit | release (sync).
@@ -53,6 +67,7 @@ export class CheckoutService {
     private readonly store: Store,
     private readonly payment: PaymentGateway,
     private readonly coupons: CouponService,
+    private readonly idempotencyTtlMs = DEFAULT_IDEMPOTENCY_TTL_MS,
   ) {}
 
   async checkout(req: CheckoutRequest): Promise<CheckoutResult> {
@@ -60,34 +75,75 @@ export class CheckoutService {
     const fingerprint = JSON.stringify([req.cartId, couponCode, req.expectedTotalCents ?? null]);
 
     // --- Idempotency (sync) -------------------------------------------------
-    const previous = this.idempotency.get(req.idempotencyKey);
+    const previous = this.currentRecord(req.idempotencyKey);
     if (previous) {
       if (previous.fingerprint !== fingerprint) {
         throw new AppError('IDEMPOTENCY_KEY_REUSED', 'This Idempotency-Key was already used for a different checkout request');
       }
-      if (previous.state === 'completed') {
-        return { order: this.store.orders.get(previous.orderId)!, replayed: true };
+      switch (previous.state) {
+        case 'completed':
+          return { order: this.store.orders.get(previous.orderId)!, replayed: true };
+        case 'in_progress':
+          // Same request still in flight: share its outcome (success or error).
+          return { order: await previous.promise, replayed: true };
+        case 'payment_unknown':
+          // Ask the provider again instead of charging again.
+          return this.run(req.idempotencyKey, fingerprint, previous.reservation, () => this.reconcile(previous.reservation, req.idempotencyKey));
       }
-      // Same request still in flight: share its outcome (success or error).
-      return { order: await previous.promise, replayed: true };
     }
 
     // --- Reserve (sync; throws before mutating anything) --------------------
     const reservation = this.reserve(req);
 
     // --- Charge + commit/release (async) ------------------------------------
-    const promise = this.complete(reservation, req.idempotencyKey);
-    this.idempotency.set(req.idempotencyKey, { state: 'in_progress', fingerprint, promise });
+    return this.run(req.idempotencyKey, fingerprint, reservation, () => this.complete(reservation, req.idempotencyKey));
+  }
+
+  /**
+   * Background pass (run on an interval by the server): settles checkouts
+   * whose payment outcome was unknown, and forgets expired idempotency keys.
+   */
+  async runMaintenance(): Promise<void> {
+    const now = this.store.now().getTime();
+    const settling: Promise<unknown>[] = [];
+    for (const [key, record] of this.idempotency) {
+      if (record.state === 'completed' && record.expiresAt <= now) this.idempotency.delete(key);
+      if (record.state === 'payment_unknown') {
+        const { fingerprint, reservation } = record;
+        settling.push(this.run(key, fingerprint, reservation, () => this.reconcile(reservation, key)).catch(() => undefined));
+      }
+    }
+    await Promise.all(settling);
+  }
+
+  /** Records the attempt under its key and stores its outcome. */
+  private async run(key: string, fingerprint: string, reservation: Reservation, work: () => Promise<Order>): Promise<CheckoutResult> {
+    const promise = work();
+    this.idempotency.set(key, { state: 'in_progress', fingerprint, promise });
     try {
       const order = await promise;
-      this.idempotency.set(req.idempotencyKey, { state: 'completed', fingerprint, orderId: order.id });
+      const expiresAt = this.store.now().getTime() + this.idempotencyTtlMs;
+      this.idempotency.set(key, { state: 'completed', fingerprint, orderId: order.id, expiresAt });
       return { order, replayed: false };
     } catch (err) {
-      // Failed attempts are not remembered: the client may fix the cause and
-      // retry with the same key.
-      this.idempotency.delete(req.idempotencyKey);
+      if (err instanceof AppError && err.code === 'PAYMENT_PENDING') {
+        this.idempotency.set(key, { state: 'payment_unknown', fingerprint, reservation });
+      } else {
+        this.idempotency.delete(key);
+      }
       throw err;
     }
+  }
+
+  private currentRecord(key: string): IdempotencyRecord | undefined {
+    const record = this.idempotency.get(key);
+    if (record?.state === 'completed' && record.expiresAt <= this.store.now().getTime()) {
+      // Expired: the key is free again. The cart is still checked out, so
+      // a late retry gets CART_ALREADY_CHECKED_OUT with the orderId.
+      this.idempotency.delete(key);
+      return undefined;
+    }
+    return record;
   }
 
   getOrder(orderId: string): Order {
@@ -157,24 +213,46 @@ export class CheckoutService {
   }
 
   private async complete(r: Reservation, idempotencyKey: string): Promise<Order> {
-    let paymentId: string | null = null;
-    if (r.totalCents > 0) {
-      let result;
-      try {
-        result = await this.payment.charge({ reference: r.attemptId, amountCents: r.totalCents, idempotencyKey });
-      } catch (err) {
-        this.release(r);
-        throw new AppError('PAYMENT_FAILED', 'Payment provider error; nothing was charged by this service', {
-          cause: err instanceof Error ? err.message : String(err),
-        });
-      }
-      if (result.status === 'declined') {
-        this.release(r);
-        throw new AppError('PAYMENT_DECLINED', `Payment declined: ${result.reason}`);
-      }
-      paymentId = result.paymentId;
+    if (r.totalCents === 0) return this.commit(r, null);
+    let outcome: ChargeOutcome;
+    try {
+      outcome = await this.payment.charge({ reference: r.attemptId, amountCents: r.totalCents, idempotencyKey });
+    } catch {
+      // The charge may or may not have happened. Never guess: ask.
+      outcome = await this.lookupCharge(idempotencyKey);
     }
-    return this.commit(r, paymentId);
+    return this.settle(r, outcome);
+  }
+
+  private async reconcile(r: Reservation, idempotencyKey: string): Promise<Order> {
+    return this.settle(r, await this.lookupCharge(idempotencyKey));
+  }
+
+  private async lookupCharge(idempotencyKey: string): Promise<ChargeOutcome> {
+    try {
+      return (await this.payment.getCharge(idempotencyKey)) ?? { status: 'not_charged' };
+    } catch {
+      return { status: 'unknown' };
+    }
+  }
+
+  /** Sync: apply a payment outcome to the reservation. */
+  private settle(r: Reservation, outcome: ChargeOutcome): Order {
+    switch (outcome.status) {
+      case 'succeeded':
+        return this.commit(r, outcome.paymentId);
+      case 'declined':
+        this.release(r);
+        throw new AppError('PAYMENT_DECLINED', `Payment declined: ${outcome.reason}`);
+      case 'not_charged':
+        this.release(r);
+        throw new AppError('PAYMENT_FAILED', 'Payment provider error; the provider confirmed nothing was charged');
+      case 'unknown':
+        // Keep stock and coupon held: releasing could sell goods that were paid for.
+        throw new AppError('PAYMENT_PENDING', 'Payment outcome is not confirmed yet. Retry with the same Idempotency-Key.', {
+          cartId: r.cart.id,
+        });
+    }
   }
 
   /** Sync: turn the reservation into a placed order. */

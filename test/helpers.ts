@@ -8,7 +8,9 @@ export const TEST_PRODUCTS: Product[] = [
   { id: 'rare', name: 'Rare Print', unitPriceCents: 5000, stock: 1 },
 ];
 
-export function makeShop(opts: { payment?: PaymentGateway; products?: Product[]; n?: number; percent?: number } = {}): Shop {
+export function makeShop(
+  opts: { payment?: PaymentGateway; products?: Product[]; n?: number; percent?: number; now?: () => Date; idempotencyTtlMs?: number } = {},
+): Shop {
   let i = 0;
   return createShop({
     products: opts.products ?? TEST_PRODUCTS.map((p) => ({ ...p })),
@@ -16,7 +18,8 @@ export function makeShop(opts: { payment?: PaymentGateway; products?: Product[];
     discountPercent: opts.percent ?? 10,
     payment: opts.payment,
     paymentLatencyMs: 0,
-    now: () => new Date('2026-01-01T00:00:00.000Z'),
+    idempotencyTtlMs: opts.idempotencyTtlMs,
+    now: opts.now ?? (() => new Date('2026-01-01T00:00:00.000Z')),
     newId: () => `id-${++i}`,
   });
 }
@@ -44,6 +47,15 @@ export class ManualPaymentGateway implements PaymentGateway {
   readonly calls: ChargeRequest[] = [];
   /** When true, charges succeed immediately (e.g. while setting up milestones). */
   autoApprove = false;
+  /** What `getCharge` answers: a result, null (never received) or 'throw' (provider unreachable). */
+  lookup: ChargeResult | null | 'throw' = null;
+  readonly lookups: string[] = [];
+
+  async getCharge(idempotencyKey: string): Promise<ChargeResult | null> {
+    this.lookups.push(idempotencyKey);
+    if (this.lookup === 'throw') throw new Error('provider unreachable');
+    return this.lookup;
+  }
   private readonly pending: { resolve: (r: ChargeResult) => void; reject: (e: Error) => void }[] = [];
 
   charge(request: ChargeRequest): Promise<ChargeResult> {

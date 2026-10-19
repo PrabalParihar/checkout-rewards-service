@@ -13,6 +13,7 @@ export interface ShopOptions {
   discountPercent: number;
   payment?: PaymentGateway;
   paymentLatencyMs?: number;
+  idempotencyTtlMs?: number;
   now?: () => Date;
   newId?: () => string;
 }
@@ -30,7 +31,7 @@ export function createShop(opts: ShopOptions) {
     catalog: new CatalogService(store),
     carts: new CartService(store),
     coupons,
-    checkout: new CheckoutService(store, payment, coupons),
+    checkout: new CheckoutService(store, payment, coupons, opts.idempotencyTtlMs),
     report: new ReportService(store, coupons),
   };
 }

@@ -22,7 +22,8 @@ export type ErrorCode =
   | 'IDEMPOTENCY_KEY_REQUIRED'
   | 'IDEMPOTENCY_KEY_REUSED'
   | 'PAYMENT_DECLINED'
-  | 'PAYMENT_FAILED';
+  | 'PAYMENT_FAILED'
+  | 'PAYMENT_PENDING';
 
 const STATUS: Record<ErrorCode, number> = {
   VALIDATION_ERROR: 400,
@@ -46,6 +47,8 @@ const STATUS: Record<ErrorCode, number> = {
   COUPON_INVALID: 422,
   IDEMPOTENCY_KEY_REUSED: 422,
   PAYMENT_FAILED: 502,
+  // Outcome not yet known; reservation is held. Retry with the same key.
+  PAYMENT_PENDING: 503,
 };
 
 export class AppError extends Error {

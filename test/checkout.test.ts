@@ -179,7 +179,7 @@ describe('checkout: payment failures release everything', () => {
     assert.equal((await retry).replayed, false);
   });
 
-  it('a provider error is reported as PAYMENT_FAILED and also releases', async () => {
+  it('a provider error with no charge on record is PAYMENT_FAILED and releases', async () => {
     const payment = new ManualPaymentGateway();
     const shop = makeShop({ payment });
     const cartId = cartWith(shop, { book: 2 });
@@ -188,14 +188,108 @@ describe('checkout: payment failures release everything', () => {
     payment.fail(0);
     await assert.rejects(attempt, code('PAYMENT_FAILED'));
     assert.equal(shop.catalog.get('book').stock, 10);
+    assert.deepEqual(payment.lookups, ['k'], 'released only after the provider confirmed no charge');
+  });
+});
+
+describe('checkout: unknown payment outcomes', () => {
+  it('if the charge call errors but the provider did charge, the order is placed', async () => {
+    const payment = new ManualPaymentGateway();
+    payment.lookup = { status: 'succeeded', paymentId: 'pay-late' };
+    const shop = makeShop({ payment });
+    const attempt = shop.checkout.checkout({ cartId: cartWith(shop, { rare: 1 }), idempotencyKey: 'k' });
+    await flush();
+    payment.fail(0);
+
+    const { order } = await attempt;
+    assert.equal(order.paymentId, 'pay-late');
+    assert.equal(payment.calls.length, 1, 'never charged twice');
+    assert.equal(shop.catalog.get('rare').stock, 0);
+  });
+
+  it('if the provider cannot answer, everything stays held until a retry learns the outcome', async () => {
+    const payment = new ManualPaymentGateway();
+    payment.autoApprove = true;
+    const shop = makeShop({ payment, n: 1 });
+    await shop.checkout.checkout({ cartId: cartWith(shop, { pen: 1 }), idempotencyKey: 'setup' });
+    const coupon = shop.coupons.generate();
+    payment.autoApprove = false;
+
+    const cartId = cartWith(shop, { rare: 1 });
+    const attempt = shop.checkout.checkout({ cartId, idempotencyKey: 'k', couponCode: coupon.code });
+    await flush();
+    payment.lookup = 'throw';
+    payment.fail(0);
+    await assert.rejects(attempt, code('PAYMENT_PENDING'));
+
+    // Held, not released: the goods may already be paid for.
+    assert.equal(shop.catalog.get('rare').stock, 0);
+    assert.equal(shop.coupons.list().find((c) => c.code === coupon.code)!.status, 'reserved');
+    assert.equal(shop.carts.view(cartId).status, 'checking_out');
+    await assert.rejects(shop.checkout.checkout({ cartId, idempotencyKey: 'other' }), code('CART_CHECKOUT_IN_PROGRESS'));
+    assert.equal(shop.report.build().totalOrders, 1, 'not counted as an order yet');
+
+    // Provider recovers and reports the charge succeeded; the client retries.
+    payment.lookup = { status: 'succeeded', paymentId: 'pay-confirmed' };
+    const retry = await shop.checkout.checkout({ cartId, idempotencyKey: 'k', couponCode: coupon.code });
+    assert.equal(retry.order.paymentId, 'pay-confirmed');
+    assert.equal(retry.order.discount?.couponCode, coupon.code);
+    assert.equal(payment.calls.length, 2, 'setup charge + the one real attempt; the retry only looked it up');
+    assert.equal(shop.coupons.list().find((c) => c.code === coupon.code)!.status, 'redeemed');
+  });
+
+  it('the maintenance pass settles pending checkouts without a client retry', async () => {
+    const payment = new ManualPaymentGateway();
+    const shop = makeShop({ payment });
+    const cartId = cartWith(shop, { book: 2 });
+    const attempt = shop.checkout.checkout({ cartId, idempotencyKey: 'k' });
+    await flush();
+    payment.lookup = 'throw';
+    payment.fail(0);
+    await assert.rejects(attempt, code('PAYMENT_PENDING'));
+    assert.equal(shop.catalog.get('book').stock, 8);
+
+    payment.lookup = null; // provider confirms it never received the charge
+    await shop.checkout.runMaintenance();
+    assert.equal(shop.catalog.get('book').stock, 10);
+    assert.equal(shop.carts.view(cartId).status, 'open');
+
+    // The key is free again, so the customer can simply retry.
+    payment.autoApprove = true;
+    const { order } = await shop.checkout.checkout({ cartId, idempotencyKey: 'k' });
+    assert.equal(order.totalCents, 2598);
+  });
+});
+
+describe('checkout: idempotency key expiry', () => {
+  it('replays within the TTL; after it the cart itself still prevents a second order', async () => {
+    let now = Date.parse('2026-01-01T00:00:00Z');
+    const shop = makeShop({ now: () => new Date(now), idempotencyTtlMs: 60_000 });
+    const cartId = cartWith(shop, { pen: 1 });
+    const { order } = await shop.checkout.checkout({ cartId, idempotencyKey: 'k' });
+
+    now += 59_000;
+    assert.equal((await shop.checkout.checkout({ cartId, idempotencyKey: 'k' })).replayed, true);
+
+    now += 2_000;
+    await shop.checkout.runMaintenance(); // prunes the expired record
+    await assert.rejects(shop.checkout.checkout({ cartId, idempotencyKey: 'k' }), (err: any) => {
+      assert.equal(err.code, 'CART_ALREADY_CHECKED_OUT');
+      assert.equal(err.details.orderId, order.id);
+      return true;
+    });
+    assert.equal(shop.checkout.listOrders().length, 1);
   });
 });
 
 /** A shop whose fake gateway has real (tiny) latency, so checkouts interleave on the event loop. */
 function createRealisticShop() {
-  const payment = { charge: async () => {
-    await new Promise((r) => setTimeout(r, Math.random() * 5));
-    return { status: 'succeeded' as const, paymentId: 'p' };
-  } };
+  const payment = {
+    charge: async () => {
+      await new Promise((r) => setTimeout(r, Math.random() * 5));
+      return { status: 'succeeded' as const, paymentId: 'p' };
+    },
+    getCharge: async () => null,
+  };
   return makeShop({ payment });
 }

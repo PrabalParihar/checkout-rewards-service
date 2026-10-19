@@ -54,6 +54,7 @@ export function buildApp(shop: Shop): FastifyInstance {
 
   app.setErrorHandler((err, _req, reply) => {
     if (isAppError(err)) {
+      if (err.code === 'PAYMENT_PENDING') reply.header('Retry-After', '5');
       return reply.status(err.status).send({ error: { code: err.code, message: err.message, details: err.details } });
     }
     // Fastify's own client errors: malformed JSON, wrong content type, too large.

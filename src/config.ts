@@ -9,6 +9,10 @@ const schema = z.object({
   DISCOUNT_PERCENT: z.coerce.number().int().min(1).max(100).default(10),
   /** Simulated latency of the fake payment provider, so checkouts genuinely overlap. */
   PAYMENT_LATENCY_MS: z.coerce.number().int().min(0).max(10_000).default(50),
+  /** How long a completed checkout can be replayed by its Idempotency-Key. */
+  IDEMPOTENCY_TTL_HOURS: z.coerce.number().int().min(1).max(24 * 30).default(24),
+  /** How often to settle unknown payment outcomes and prune expired keys. */
+  MAINTENANCE_INTERVAL_MS: z.coerce.number().int().min(1_000).max(3_600_000).default(30_000),
 });
 
 export type Config = z.infer<typeof schema>;

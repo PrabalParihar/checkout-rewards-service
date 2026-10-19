@@ -9,6 +9,7 @@ const shop = createShop({
   rewardEveryNOrders: config.REWARD_EVERY_N_ORDERS,
   discountPercent: config.DISCOUNT_PERCENT,
   paymentLatencyMs: config.PAYMENT_LATENCY_MS,
+  idempotencyTtlMs: config.IDEMPOTENCY_TTL_HOURS * 60 * 60 * 1000,
 });
 const app = buildApp(shop);
 
@@ -18,9 +19,13 @@ console.log(
     `(coupon every ${config.REWARD_EVERY_N_ORDERS} orders, ${config.DISCOUNT_PERCENT}% off, payment latency ${config.PAYMENT_LATENCY_MS}ms)`,
 );
 
+const maintenance = setInterval(() => void shop.checkout.runMaintenance(), config.MAINTENANCE_INTERVAL_MS);
+maintenance.unref();
+
 for (const signal of ['SIGINT', 'SIGTERM'] as const) {
   process.once(signal, () => {
     // Stop accepting requests; in-flight checkouts finish before exit.
+    clearInterval(maintenance);
     void app.close().then(() => process.exit(0));
   });
 }
