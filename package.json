@@ -12,7 +12,7 @@
     "start": "tsx src/server.ts",
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "test": "tsx --test test/*.test.ts",
+    "test": "tsx --test --test-timeout=5000 test/*.test.ts",
     "demo": "bash scripts/demo.sh"
   },
   "dependencies": {
