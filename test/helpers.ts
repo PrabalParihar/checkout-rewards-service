@@ -1,3 +1,4 @@
+import type { ChargeRequest, ChargeResult, PaymentGateway } from '../src/payment.js';
 import { createShop, type Shop } from '../src/shop.js';
 import type { Product } from '../src/types.js';
 
@@ -7,11 +8,58 @@ export const TEST_PRODUCTS: Product[] = [
   { id: 'rare', name: 'Rare Print', unitPriceCents: 5000, stock: 1 },
 ];
 
-export function makeShop(opts: { products?: Product[] } = {}): Shop {
+export function makeShop(opts: { payment?: PaymentGateway; products?: Product[] } = {}): Shop {
   let i = 0;
   return createShop({
-    products: opts.products ?? TEST_PRODUCTS,
+    products: opts.products ?? TEST_PRODUCTS.map((p) => ({ ...p })),
+    payment: opts.payment,
+    paymentLatencyMs: 0,
     now: () => new Date('2026-01-01T00:00:00.000Z'),
     newId: () => `id-${++i}`,
   });
 }
+
+/** Builds a cart with the given lines and returns its id. */
+export function cartWith(shop: Shop, items: Record<string, number>): string {
+  const { id } = shop.carts.create();
+  for (const [productId, qty] of Object.entries(items)) shop.carts.addItem(id, productId, qty);
+  return id;
+}
+
+/** Matcher for assert.throws / assert.rejects on AppError codes. */
+export const code = (expected: string) => (err: unknown) => {
+  const actual = (err as { code?: string }).code;
+  if (actual !== expected) throw new Error(`expected error ${expected}, got ${actual ?? String(err)}`);
+  return true;
+};
+
+/**
+ * A payment gateway the test controls: every charge stays pending until the
+ * test settles it. This makes "request B arrives while A is paying"
+ * deterministic instead of timing-dependent.
+ */
+export class ManualPaymentGateway implements PaymentGateway {
+  readonly calls: ChargeRequest[] = [];
+  private readonly pending: { resolve: (r: ChargeResult) => void; reject: (e: Error) => void }[] = [];
+
+  charge(request: ChargeRequest): Promise<ChargeResult> {
+    this.calls.push(request);
+    return new Promise((resolve, reject) => this.pending.push({ resolve, reject }));
+  }
+
+  approve(index = 0) {
+    this.pending[index]!.resolve({ status: 'succeeded', paymentId: `pay-${index}` });
+  }
+  approveAll() {
+    this.pending.forEach((_, i) => this.approve(i));
+  }
+  decline(index = 0, reason = 'card_declined') {
+    this.pending[index]!.resolve({ status: 'declined', reason });
+  }
+  fail(index = 0) {
+    this.pending[index]!.reject(new Error('provider timeout'));
+  }
+}
+
+/** Let pending promise callbacks run. */
+export const flush = () => new Promise((resolve) => setImmediate(resolve));

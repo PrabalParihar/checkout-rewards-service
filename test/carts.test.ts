@@ -1,8 +1,8 @@
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
-import { makeShop } from './helpers.js';
+import { code, makeShop } from './helpers.js';
 
-const code = (c: string) => (err: unknown) => (err as { code?: string }).code === c;
+
 
 describe('carts', () => {
   it('creates an empty open cart', () => {
