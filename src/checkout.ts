@@ -1,12 +1,14 @@
+import { normalizeCode, type CouponService } from './coupons.js';
 import { AppError } from './errors.js';
-import { lineTotal, sum, type Cents } from './money.js';
+import { lineTotal, percentOf, sum, type Cents } from './money.js';
 import type { PaymentGateway } from './payment.js';
 import type { Store } from './store.js';
-import type { Cart, Order, OrderLine } from './types.js';
+import type { Cart, Coupon, Order, OrderDiscount, OrderLine } from './types.js';
 
 export interface CheckoutRequest {
   cartId: string;
   idempotencyKey: string;
+  couponCode?: string;
   /**
    * Optional optimistic check: the total the client displayed. If the server
    * computes something else (price changed, coupon differs) checkout fails
@@ -27,6 +29,8 @@ interface Reservation {
   cart: Cart;
   lines: OrderLine[];
   subtotalCents: Cents;
+  coupon: Coupon | null;
+  discount: OrderDiscount | null;
   totalCents: Cents;
 }
 
@@ -48,10 +52,12 @@ export class CheckoutService {
   constructor(
     private readonly store: Store,
     private readonly payment: PaymentGateway,
+    private readonly coupons: CouponService,
   ) {}
 
   async checkout(req: CheckoutRequest): Promise<CheckoutResult> {
-    const fingerprint = JSON.stringify([req.cartId, req.expectedTotalCents ?? null]);
+    const couponCode = req.couponCode === undefined ? null : normalizeCode(req.couponCode);
+    const fingerprint = JSON.stringify([req.cartId, couponCode, req.expectedTotalCents ?? null]);
 
     // --- Idempotency (sync) -------------------------------------------------
     const previous = this.idempotency.get(req.idempotencyKey);
@@ -126,7 +132,15 @@ export class CheckoutService {
     }
 
     const subtotalCents = sum(lines.map((l) => l.lineTotalCents));
-    const totalCents = subtotalCents;
+
+    // Coupon: validated here, reserved below, redeemed only on commit.
+    const coupon = req.couponCode === undefined ? null : this.coupons.findRedeemable(req.couponCode);
+    const discount: OrderDiscount | null = coupon && {
+      couponCode: coupon.code,
+      percent: coupon.percent,
+      amountCents: percentOf(subtotalCents, coupon.percent),
+    };
+    const totalCents = subtotalCents - (discount?.amountCents ?? 0);
     if (req.expectedTotalCents !== undefined && req.expectedTotalCents !== totalCents) {
       throw new AppError('QUOTE_CHANGED', 'The order total changed since it was quoted', {
         expectedTotalCents: req.expectedTotalCents,
@@ -136,9 +150,10 @@ export class CheckoutService {
 
     // All checks passed: take the reservation. Nothing above mutated state.
     for (const line of lines) this.store.products.get(line.productId)!.stock -= line.quantity;
+    if (coupon) coupon.status = 'reserved';
     cart.status = 'checking_out';
 
-    return { attemptId: this.store.newId(), cart, lines, subtotalCents, totalCents };
+    return { attemptId: this.store.newId(), cart, lines, subtotalCents, coupon, discount, totalCents };
   }
 
   private async complete(r: Reservation, idempotencyKey: string): Promise<Order> {
@@ -170,12 +185,17 @@ export class CheckoutService {
       cartId: r.cart.id,
       lines: r.lines,
       subtotalCents: r.subtotalCents,
-      discount: null,
+      discount: r.discount,
       totalCents: r.totalCents,
       paymentId,
       placedAt: this.store.timestamp(),
     };
     this.store.orders.set(order.id, order);
+    if (r.coupon) {
+      r.coupon.status = 'redeemed';
+      r.coupon.redeemedByOrderId = order.id;
+      r.coupon.redeemedAt = order.placedAt;
+    }
     r.cart.status = 'checked_out';
     r.cart.orderId = order.id;
     return order;
@@ -184,6 +204,7 @@ export class CheckoutService {
   /** Sync: undo every effect of `reserve`. */
   private release(r: Reservation): void {
     for (const line of r.lines) this.store.products.get(line.productId)!.stock += line.quantity;
+    if (r.coupon) r.coupon.status = 'available';
     r.cart.status = 'open';
   }
 }

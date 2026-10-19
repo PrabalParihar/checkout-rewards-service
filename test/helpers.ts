@@ -8,10 +8,12 @@ export const TEST_PRODUCTS: Product[] = [
   { id: 'rare', name: 'Rare Print', unitPriceCents: 5000, stock: 1 },
 ];
 
-export function makeShop(opts: { payment?: PaymentGateway; products?: Product[] } = {}): Shop {
+export function makeShop(opts: { payment?: PaymentGateway; products?: Product[]; n?: number; percent?: number } = {}): Shop {
   let i = 0;
   return createShop({
     products: opts.products ?? TEST_PRODUCTS.map((p) => ({ ...p })),
+    rewardEveryNOrders: opts.n ?? 3,
+    discountPercent: opts.percent ?? 10,
     payment: opts.payment,
     paymentLatencyMs: 0,
     now: () => new Date('2026-01-01T00:00:00.000Z'),
@@ -40,10 +42,13 @@ export const code = (expected: string) => (err: unknown) => {
  */
 export class ManualPaymentGateway implements PaymentGateway {
   readonly calls: ChargeRequest[] = [];
+  /** When true, charges succeed immediately (e.g. while setting up milestones). */
+  autoApprove = false;
   private readonly pending: { resolve: (r: ChargeResult) => void; reject: (e: Error) => void }[] = [];
 
   charge(request: ChargeRequest): Promise<ChargeResult> {
     this.calls.push(request);
+    if (this.autoApprove) return Promise.resolve({ status: 'succeeded', paymentId: `pay-auto-${this.calls.length}` });
     return new Promise((resolve, reject) => this.pending.push({ resolve, reject }));
   }
 
@@ -63,3 +68,10 @@ export class ManualPaymentGateway implements PaymentGateway {
 
 /** Let pending promise callbacks run. */
 export const flush = () => new Promise((resolve) => setImmediate(resolve));
+
+/** Places `count` one-pen orders, e.g. to reach a coupon milestone. */
+export async function placeOrders(shop: Shop, count: number, prefix = 'fill') {
+  for (let i = 0; i < count; i++) {
+    await shop.checkout.checkout({ cartId: cartWith(shop, { pen: 1 }), idempotencyKey: `${prefix}-${i}` });
+  }
+}
