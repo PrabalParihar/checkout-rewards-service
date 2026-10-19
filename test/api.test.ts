@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { after, before, describe, it } from 'node:test';
+import { afterEach, beforeEach, describe, it } from 'node:test';
 import type { FastifyInstance } from 'fastify';
 import { buildApp } from '../src/app.js';
 import { createShop } from '../src/shop.js';
@@ -23,11 +23,12 @@ describe('HTTP API', () => {
   let app: FastifyInstance;
   let base: string;
 
-  before(async () => {
+  // A fresh server and store per test: no test depends on another's state.
+  beforeEach(async () => {
     app = startServer();
     base = await app.listen({ port: 0, host: '127.0.0.1' });
   });
-  after(() => app.close());
+  afterEach(() => app.close());
 
   const call = async (method: string, path: string, body?: unknown, headers: Record<string, string> = {}) => {
     const res = await fetch(base + path, {
@@ -47,6 +48,10 @@ describe('HTTP API', () => {
   };
   const checkout = (cartId: string, key: string, body: object = {}) =>
     call('POST', `/carts/${cartId}/checkout`, body, { 'idempotency-key': key });
+  /** Places `count` one-pen orders (n = 2, so every second one is a milestone). */
+  const placeOrders = async (count: number) => {
+    for (let i = 0; i < count; i++) assert.equal((await checkout(await newCart({ pen: 1 }), `fill-${i}`)).status, 201);
+  };
 
   it('runs the full cart -> checkout -> order flow', async () => {
     const cartId = await newCart({ book: 1, pen: 2 });
@@ -81,19 +86,19 @@ describe('HTTP API', () => {
   });
 
   it('concurrent admin coupon generation issues one coupon per milestone', async () => {
-    const report = await call('GET', '/admin/report');
-    const eligible = report.body.rewards.unrewardedMilestones.length; // orders so far, n = 2
-    const responses = await Promise.all(Array.from({ length: eligible + 3 }, () => call('POST', '/admin/coupons')));
+    await placeOrders(5); // milestones 2 and 4 reached
+    const responses = await Promise.all(Array.from({ length: 6 }, () => call('POST', '/admin/coupons')));
 
-    assert.equal(responses.filter((r) => r.status === 201).length, eligible);
+    assert.equal(responses.filter((r) => r.status === 201).length, 2);
     assert.ok(responses.filter((r) => r.status !== 201).every((r) => r.body.error.code === 'NO_ELIGIBLE_MILESTONE'));
     const milestones = responses.filter((r) => r.status === 201).map((r) => r.body.milestone);
-    assert.equal(new Set(milestones).size, milestones.length, 'no milestone rewarded twice');
+    assert.deepEqual(milestones.sort(), [2, 4], 'each milestone rewarded exactly once');
   });
 
   it('a coupon raced by two checkouts is redeemed once', async () => {
-    const { body: coupons } = await call('GET', '/admin/coupons');
-    const code = coupons.find((c: any) => c.status === 'available').code;
+    await placeOrders(2);
+    const { body: coupon } = await call('POST', '/admin/coupons');
+    const code = coupon.code;
     const [a, b] = await Promise.all([newCart({ book: 1 }), newCart({ book: 1 })]);
     const responses = await Promise.all([checkout(a, 'cpn-a', { couponCode: code }), checkout(b, 'cpn-b', { couponCode: code })]);
 
@@ -103,9 +108,14 @@ describe('HTTP API', () => {
   });
 
   it('report reconciles with /admin/orders and repeated reads are identical', async () => {
+    await placeOrders(2);
+    const { body: coupon } = await call('POST', '/admin/coupons');
+    assert.equal((await checkout(await newCart({ book: 3 }), 'discounted', { couponCode: coupon.code })).status, 201);
     const [r1, r2, orders] = await Promise.all([call('GET', '/admin/report'), call('GET', '/admin/report'), call('GET', '/admin/orders')]);
     assert.deepEqual(r1.body, r2.body);
     assert.equal(r1.body.totalOrders, orders.body.length);
+    assert.equal(r1.body.totalOrders, 3);
+    assert.equal(r1.body.totalDiscountCents, 389); // floor(3897 * 10%)
     const net = orders.body.reduce((s: number, o: any) => s + o.totalCents, 0);
     assert.equal(r1.body.netRevenueCents, net);
     assert.equal(r1.body.grossRevenueCents - r1.body.totalDiscountCents, net);
@@ -144,6 +154,39 @@ describe('HTTP API: request parsing', () => {
     const res = await app.inject({ method: 'POST', url: '/admin/coupons', headers: { 'content-type': 'application/json' }, payload: '' });
     assert.equal(res.statusCode, 409);
     assert.equal(res.json().error.code, 'NO_ELIGIBLE_MILESTONE');
+    await app.close();
+  });
+});
+
+describe('HTTP API: unconfirmed payment', () => {
+  it('returns 503 PAYMENT_PENDING with Retry-After, then the order once the provider confirms', async () => {
+    let providerUp = false;
+    const shop = createShop({
+      products: TEST_PRODUCTS.map((p) => ({ ...p })),
+      rewardEveryNOrders: 2,
+      discountPercent: 10,
+      payment: {
+        charge: async () => { throw new Error('timeout'); },
+        getCharge: async () => {
+          if (!providerUp) throw new Error('provider unreachable');
+          return { status: 'succeeded', paymentId: 'pay-1' };
+        },
+      },
+    });
+    const app = buildApp(shop);
+    const cart = shop.carts.create();
+    shop.carts.addItem(cart.id, 'rare', 1);
+    const request = { method: 'POST' as const, url: `/carts/${cart.id}/checkout`, headers: { 'idempotency-key': 'k' } };
+
+    const pending = await app.inject(request);
+    assert.equal(pending.statusCode, 503);
+    assert.equal(pending.headers['retry-after'], '5');
+    assert.equal(pending.json().error.code, 'PAYMENT_PENDING');
+
+    providerUp = true;
+    const placed = await app.inject(request);
+    assert.equal(placed.statusCode, 201);
+    assert.equal(placed.json().paymentId, 'pay-1');
     await app.close();
   });
 });
