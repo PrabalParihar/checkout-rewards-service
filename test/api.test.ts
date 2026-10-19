@@ -137,3 +137,13 @@ describe('HTTP API', () => {
     assert.equal(malformed.status, 400);
   });
 });
+
+describe('HTTP API: request parsing', () => {
+  it('accepts bodiless JSON POSTs as {}', async () => {
+    const app = startServer();
+    const res = await app.inject({ method: 'POST', url: '/admin/coupons', headers: { 'content-type': 'application/json' }, payload: '' });
+    assert.equal(res.statusCode, 409);
+    assert.equal(res.json().error.code, 'NO_ELIGIBLE_MILESTONE');
+    await app.close();
+  });
+});

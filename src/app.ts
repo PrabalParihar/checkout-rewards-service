@@ -40,6 +40,18 @@ function parse<T>(schema: z.ZodType<T>, value: unknown): T {
 export function buildApp(shop: Shop): FastifyInstance {
   const app = Fastify({ logger: false, bodyLimit: 16 * 1024 });
 
+  // Treat an empty JSON body as {} so bodiless POSTs (create cart, generate
+  // coupon, checkout without coupon) work from any client.
+  app.addContentTypeParser('application/json', { parseAs: 'string' }, (_req, body, done) => {
+    const text = String(body);
+    if (text.trim() === '') return done(null, {});
+    try {
+      done(null, JSON.parse(text));
+    } catch {
+      done(new AppError('VALIDATION_ERROR', 'Body is not valid JSON'), undefined);
+    }
+  });
+
   app.setErrorHandler((err, _req, reply) => {
     if (isAppError(err)) {
       return reply.status(err.status).send({ error: { code: err.code, message: err.message, details: err.details } });
