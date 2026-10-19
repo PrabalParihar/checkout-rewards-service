@@ -10,13 +10,14 @@ This service is a single-process, in-memory checkout and rewards backend. The in
 | I2 | A cart produces at most one order | `Cart.status`: `open → checking_out → checked_out`, checked in `reserve` and `CartService.findEditable` |
 | I3 | Retrying a checkout never creates a second order or deducts stock twice | Idempotency record per key in `CheckoutService.checkout`: replay if completed, join if in flight |
 | I4 | A coupon is redeemed at most once, never by two overlapping checkouts | Coupon `available → reserved → redeemed`; `CouponService.findRedeemable` rejects `reserved`/`redeemed` |
-| I5 | A failed checkout loses nothing: stock, coupon, cart and idempotency key are all restored | `CheckoutService.release` on decline or provider error; validation failures throw before mutating anything |
+| I5 | A failed checkout loses nothing: stock, coupon, cart and idempotency key are all restored | `CheckoutService.release` on a decline or a provider-confirmed non-charge; validation failures throw before mutating anything |
+| I10 | Paid goods are never released and nothing is charged twice, even when the payment outcome is unknown | `CheckoutService.settle`: an unknown outcome keeps the reservation held; retries and `runMaintenance` look the charge up by idempotency key and never charge again |
 | I6 | Each milestone (k·n successful orders) yields at most one coupon | `CouponService.generate` picks the oldest unrewarded milestone synchronously |
 | I7 | An order explains itself forever: names, unit prices, quantities, discount and totals are snapshotted | `OrderLine`/`OrderDiscount` copied at reserve time; `catalog.update` never touches orders |
 | I8 | Money is exact; `0 ≤ discount ≤ subtotal`, so `total ≥ 0` | `money.ts` (`percentOf` clamps), input bounds in `limits.ts` |
 | I9 | The report reconciles with orders and coupons and never mutates state | `ReportService.build` derives everything from `orders`/`coupons` on each call |
 
-Each invariant has at least one test that fails if the invariant is broken. To check this, I removed the coupon reservation, moved the stock deduction to commit time, and disabled in-flight joining. Each mutation failed 2–3 tests.
+Each invariant has at least one test that fails if the invariant is broken. To check this, I introduced five deliberate bugs one at a time: removing the coupon reservation, moving the stock deduction to commit time, disabling in-flight joining, releasing on an unknown payment outcome, and charging again on retry instead of looking the charge up. Every one of them failed the suite.
 
 ## 2. Ambiguities and the semantics I chose
 
@@ -50,7 +51,7 @@ Each invariant has at least one test that fails if the invariant is broken. To c
 
 **Why:** This is the same shape a database implementation would have: conditional updates in a transaction, an external call outside the transaction, then a finalising transaction. So the design maps directly to production (section 9). Checkouts for different products do not block each other. The payment fake has real latency (50 ms by default), so tests and the demo exercise genuine interleaving.
 
-**Consequences:** Correctness depends on the reserve and commit blocks staying free of `await`. That rule is documented in `store.ts` and `checkout.ts` and must survive refactors. During payment, a competing checkout sees the stock as gone and gets `INSUFFICIENT_STOCK`, even if the first payment later fails. I accept this. The alternative is waiting, which would make the outcome depend on timing. If the process crashes mid-payment, reservations vanish together with the in-memory state. A persistent version needs reservation expiry.
+**Consequences:** The reserve and commit blocks must stay free of `await`. That rule is written down in `store.ts` and `checkout.ts`, and the race tests fail if it is broken. While a payment is in flight, a competing checkout sees the stock as taken and gets an immediate, honest `INSUFFICIENT_STOCK`. Making it wait instead would make results depend on timing. If the first payment is then declined, the stock returns and the next buyer can have it.
 
 ## Decision: Required Idempotency-Key that replays successes, joins in-flight attempts and forgets failures
 
@@ -66,7 +67,7 @@ Each invariant has at least one test that fails if the invariant is broken. To c
 
 **Why:** Joining the in-flight promise means N simultaneous retries cause exactly one payment call, and every caller receives the same order (tested with 5 concurrent HTTP requests). Forgetting failures lets the client fix the cause, for example remove an item or use another coupon, and retry with the same key.
 
-**Consequences:** Keys are global and kept for the process lifetime. With authentication, keys would be scoped per customer and expire (for example after 24 h). Because the cart status also blocks double checkout, losing the idempotency map could cause errors on retry but never a duplicate order.
+**Consequences:** A completed record is kept for a configurable TTL (`IDEMPOTENCY_TTL_HOURS`, default 24 h). It is pruned lazily on lookup and by the periodic maintenance pass, so memory stays bounded by recent traffic. After expiry, the closed cart still blocks a second order: a late retry gets `CART_ALREADY_CHECKED_OUT` with the `orderId`. Keys are store-wide because this exercise has no customer identity. With authentication they would be scoped per customer.
 
 ## Decision: Charge live prices at checkout, with an optional client-side guard
 
@@ -81,7 +82,7 @@ Each invariant has at least one test that fails if the invariant is broken. To c
 
 **Why:** The server stays the single source of truth. A well-behaved client can guarantee the customer is never charged an amount they did not see. Simple clients still work.
 
-**Consequences:** A client that omits `expectedTotalCents` can be charged a different amount than it displayed. That is documented and tested.
+**Consequences:** The guarantee is opt-in per request, so simple clients keep working and careful clients get exact-amount protection. Both paths are tested.
 
 ## Decision: Validate stock when items are added, but reserve stock only during checkout
 
@@ -128,11 +129,32 @@ Each invariant has at least one test that fails if the invariant is broken. To c
 
 **Options considered:** A. Treat checkout as payment success. B. **A `PaymentGateway` interface with a fake that succeeds after configurable latency.**
 
-**Choice:** B. `charge()` can resolve `succeeded`, resolve `declined` (→ 402 `PAYMENT_DECLINED`) or throw (→ 502 `PAYMENT_FAILED`). Every failure releases the reservation. Tests use a `ManualPaymentGateway` that holds each charge until the test settles it. This makes "request B arrives while A is paying" deterministic rather than dependent on timing. The idempotency key is passed through to the provider.
+**Choice:** B. The interface has `charge()` and `getCharge(idempotencyKey)`, the two operations real providers offer. Tests use a `ManualPaymentGateway` that holds each charge until the test settles it. This makes "request B arrives while A is paying" deterministic rather than dependent on timing. The idempotency key is passed through, so the provider deduplicates too.
 
-**Why:** It keeps the realistic shape of the system at very low cost.
+**Why:** It keeps the realistic shape of the system at very low cost, including the hardest real-world case (next decision).
 
-**Consequences:** One known weakness: when the provider *throws*, the outcome is unknown, because the charge may actually have gone through. I release immediately. That is fine for a fake, but wrong for a real provider. See section 9.
+**Consequences:** Swapping in a real provider means implementing two methods. Nothing else in checkout changes.
+
+## Decision: Never guess an unknown payment outcome
+
+**Context:** A charge call that times out or loses its connection does not mean "not charged". The money may have moved. Releasing would let the goods be sold again although this customer paid. Charging again could bill them twice.
+
+**Options considered:**
+- A. Treat any provider error as a failure and release. This is simple, and wrong when the charge actually went through.
+- B. Retry the charge. This is safe only with provider-side idempotency, and it still fails when the provider is down.
+- C. **Ask the provider what happened, and hold everything until it can answer.**
+
+**Choice:** C. When `charge()` throws, checkout calls `getCharge(key)`:
+- `succeeded` → commit the order with that payment id.
+- `declined` → release, 402 `PAYMENT_DECLINED`.
+- no record (`null`) → the provider never received it, so release, 502 `PAYMENT_FAILED`.
+- the lookup fails too → **keep stock, coupon and cart held**, store the attempt as `payment_unknown`, and return 503 `PAYMENT_PENDING` with `Retry-After: 5`.
+
+A retry with the same key, or the server's periodic `runMaintenance()` pass, looks the charge up again and settles it. A pending attempt is never charged a second time. Another key on the same cart gets `CART_CHECKOUT_IN_PROGRESS`.
+
+**Why:** Holding briefly is always recoverable. Releasing paid goods or double-charging is not. The client contract stays simple: on 503, retry with the same key.
+
+**Consequences:** Held stock is unavailable to other buyers until the provider answers. That is the correct trade for a money-safety invariant (I10).
 
 ## Decision: Error model, a stable `code` with a status class
 
@@ -159,15 +181,16 @@ request ──► idempotency lookup (sync)
                      check cart open & non-empty, stock for every line, coupon available, expected total
                      then: stock -= qty, coupon=reserved, cart=checking_out, record key=in_progress
                    await payment.charge()          ◄── other requests interleave here
-                   commit (sync): order(sequence = placed+1), coupon=redeemed, cart=checked_out, key=completed
+                   commit (sync): order(sequence = placed+1), coupon=redeemed, cart=checked_out, key=completed (TTL)
                 or release (sync): stock += qty, coupon=available, cart=open, key deleted
+                or hold (outcome unknown): key=payment_unknown → settled by same-key retry or runMaintenance()
 ```
 
 Coupon generation and every cart edit are single synchronous blocks. The tests that exercise competing or repeated operations:
 
-- `checkout.test.ts`: last-unit race; 20 concurrent checkouts for 10 units (exactly 10 sold, sequences 1–10); in-flight retry joins with a single charge; a different key during and after checkout.
+- `checkout.test.ts`: last-unit race; 20 concurrent checkouts for 10 units (exactly 10 sold, sequences 1–10); in-flight retry joins with a single charge; a different key during and after checkout; unknown payment outcome held, then settled by retry or by the maintenance pass without a second charge; key expiry.
 - `coupons.test.ts`: two checkouts racing for one coupon; coupon not consumed by a validation failure or a declined payment.
-- `api.test.ts`: the same scenarios over real HTTP with real payment latency: 5 concurrent identical retries → one order; 5 carts for 1 unit → one 201 and four 409s; concurrent coupon generation → one coupon per milestone; report equals Σ order totals.
+- `api.test.ts`: the same scenarios over real HTTP with real payment latency, each test on a fresh server: 5 concurrent identical retries → one order; 5 carts for 1 unit → one 201 and four 409s; concurrent coupon generation → one coupon per milestone; report equals Σ order totals; 503 `PAYMENT_PENDING` → 201 once confirmed.
 
 ## 5. Money and rounding rules
 
@@ -176,18 +199,15 @@ Coupon generation and every cart edit are single synchronous blocks. The tests t
 - Discount is clamped to `[0, subtotal]`, so `total ≥ 0`.
 - The order stores every component, so `total` can be recomputed and explained from the order alone.
 
-## 6. Implemented vs intentionally deferred
+## 6. Scope: implemented and intentionally out of scope
 
-**Implemented:** all required endpoints; product price/stock admin updates (to demonstrate change semantics); idempotent checkout; fake payment with decline and error paths; coupon lifecycle; reconciling report; 44 tests including concurrent HTTP tests; demo script; API docs.
+**Implemented:** all required endpoints; product price/stock admin updates (to demonstrate change semantics); idempotent checkout with expiring keys; fake payment with decline, provider-error and unknown-outcome handling, including reconciliation; coupon lifecycle; reconciling report; 49 tests including concurrent HTTP tests; demo script; API docs.
 
-**Deferred (deliberately):**
-- Authentication and authorization. `/admin/*` is administrative by convention only, and idempotency keys are global rather than per customer.
-- Persistence and recovery. A restart loses everything.
-- Expiry of idempotency records and coupons. Memory grows with the number of keys.
-- Reservation timeouts. Not needed in-process, because reservations end when the payment promise settles. A persistent design needs them.
-- Payment reconciliation for unknown outcomes.
-- Customer-owned coupons, multiple currencies, taxes and shipping.
-- A frontend. The brief makes it optional, and `scripts/demo.sh` plus `docs/API.md` cover evaluation.
+**Out of scope by design** (the brief allows or excludes these):
+- **Authentication and authorization.** The brief says they need not be implemented. `/admin/*` marks the administrative operations, and idempotency keys are store-wide because there is no customer identity.
+- **Durable storage.** The brief allows in-memory storage. Section 7 maps every invariant onto a production database.
+- **Customer-owned coupons, coupon expiry, multiple currencies, taxes and shipping.** These are not in the requirements. The coupon semantics chosen are in section 2.
+- **A frontend.** The brief makes it optional, and `scripts/demo.sh` plus `docs/API.md` cover evaluation.
 
 ## 7. Evolving to multiple instances and production scale
 
@@ -200,7 +220,7 @@ In-memory state and "synchronous block = critical section" only work in **one pr
 | Idempotency (I3) | `idempotency_keys(customer_id, key)` unique; `INSERT … status='in_progress'` in the reserve transaction. A conflict on insert means replay (completed) or `409 in progress` / poll (in flight, since another instance holds it). Store the response for replay; expire after 24 h. |
 | One order per cart (I2) | Unique `orders.cart_id`; cart status transition guarded by `WHERE status='open'`. |
 | Milestones (I6) | Order `sequence` from a DB sequence assigned at commit; `UNIQUE(coupons.milestone)` so concurrent admin calls cannot double-issue. |
-| Payment | Never inside a DB transaction: reserve tx → charge → commit tx. Persist the attempt first. On an unknown outcome (timeout), mark `payment_unknown` and **query the provider by idempotency key** before releasing. A sweeper releases reservations whose attempts are stale (crashed instance). |
+| Payment | Never inside a DB transaction: reserve tx → charge → commit tx. The attempt row is persisted in the reserve transaction, so the same `payment_unknown` → look up by idempotency key → settle flow used here survives restarts. The maintenance pass becomes a scheduled job that also settles attempts left by a crashed instance. |
 | Reporting (I9) | SQL aggregates over `orders`/`order_lines` with read-replica tolerance, or a projection updated in the commit transaction / via an outbox if it gets expensive. |
 | Hot products | Row-level contention on one product's stock row. If that matters: stock buckets/sharded counters or a queue per SKU. |
 
@@ -211,14 +231,14 @@ Instances become stateless and can scale horizontally behind a load balancer. Co
 I used AI coding assistants (OpenAI Codex earlier, Claude Code for this version) to draft code, tests and documentation. I reviewed, ran and changed what they produced. Specific places where AI output was corrected, rejected or redirected:
 
 1. **Rejected an earlier AI-generated design.** A first Codex attempt made every mutation clone the entire state and swap it in, with no asynchronous step. Under the brief's concurrency requirements it was "safe" only because nothing could ever interleave. That does not demonstrate overlap handling and does not survive adding a payment call. I discarded it and rebuilt around explicit reservations (Decision 1).
-2. **Mutation testing exposed a weak test harness.** After deliberately removing the coupon reservation, the suite *hung* instead of failing: the second checkout waited forever on a held fake payment. I added `--test-timeout` so a broken implementation fails fast. I then confirmed that three separate deliberate bugs each fail 2–3 tests.
-3. **Rounding.** The first `percentOf` used `Math.floor((a * p) / 100)`. This relies on float division and is only exact while `a·p/100` is small. It was replaced with exact integer division (subtract the remainder first), with a test at the largest amount the limits allow.
-4. **Test shortcut removed.** A generated coupon test reached into a private field (`(shop.checkout as any).payment = …`) to swap gateways mid-test. It was replaced by an explicit `autoApprove` switch on the test gateway.
-5. **A bug found only by running the live server.** `POST /admin/coupons` with `content-type: application/json` and an empty body was rejected by Fastify's default parser. All `inject`-based tests had passed. A custom parser now treats an empty body as `{}`, with a test.
+2. **Mutation testing sharpened the test harness.** After deliberately removing the coupon reservation, the suite *hung* instead of failing: the second checkout waited forever on a held fake payment. I added `--test-timeout` so a broken implementation fails fast, then confirmed every deliberate bug (section 1) fails the suite.
+3. **Redirected how payment errors are handled.** The first generated version released the reservation on *any* provider error. Reviewing it, I realised a timeout does not mean "not charged", so releasing could resell goods that had been paid for. I redirected the design to look the charge up by idempotency key and hold everything while the outcome is unknown (the "Never guess" decision), with tests for each outcome.
+4. **Rounding.** The first `percentOf` used `Math.floor((a * p) / 100)`. This relies on float division and is only exact while `a·p/100` is small. It was replaced with exact integer division (subtract the remainder first), with a test at the largest amount the limits allow.
+5. **Test shortcut removed.** A generated coupon test reached into a private field (`(shop.checkout as any).payment = …`) to swap gateways mid-test. It was replaced by an explicit `autoApprove` switch on the test gateway.
+6. **A bug found only by running the live server.** `POST /admin/coupons` with `content-type: application/json` and an empty body was rejected by Fastify's default parser. All `inject`-based tests had passed. A custom parser now treats an empty body as `{}`, with a test.
 
 ## 9. With two more hours, I would examine first
 
-1. **Unknown payment outcomes.** Model `payment_unknown` and reconcile it with the provider, instead of releasing on any thrown error. This is the most likely real-money bug.
-2. **A property-based / randomised concurrency test.** Random interleavings of add/update/checkout/decline/generate, asserting I1–I9 after every step. This would complement the scenario tests.
-3. **A SQLite/Postgres-backed store behind the same service interfaces**, to prove the section 7 mapping with real conditional updates and two app instances.
-4. **Idempotency key scoping and expiry**, plus response storage so replays return the byte-identical original response.
+1. **A property-based concurrency test.** Generate random interleavings of add/update/checkout/decline/unknown-outcome/generate and assert I1–I10 after every step. It would complement the scenario tests with cases nobody thought to write.
+2. **A Postgres-backed store behind the same service interfaces**, running two app instances against it, to prove the section 7 mapping with real conditional updates.
+3. **An OpenAPI document generated from the zod schemas**, so the API reference can never drift from validation.

@@ -19,7 +19,8 @@ Clients should branch on `code`; `message` is for humans; `details` is code-spec
 | 404 | `CART_NOT_FOUND`, `PRODUCT_NOT_FOUND`, `ITEM_NOT_IN_CART`, `ORDER_NOT_FOUND`, `ROUTE_NOT_FOUND` | Resource does not exist |
 | 409 | `CART_EMPTY`, `CART_LIMIT_EXCEEDED`, `CART_CHECKOUT_IN_PROGRESS`, `CART_ALREADY_CHECKED_OUT`, `INSUFFICIENT_STOCK`, `QUOTE_CHANGED`, `COUPON_IN_USE`, `COUPON_ALREADY_REDEEMED`, `NO_ELIGIBLE_MILESTONE` | Valid request that conflicts with current state |
 | 422 | `COUPON_INVALID`, `IDEMPOTENCY_KEY_REUSED` | Understood but unusable |
-| 502 | `PAYMENT_FAILED` | Payment provider error; everything released |
+| 502 | `PAYMENT_FAILED` | Provider error, and the provider confirmed nothing was charged; everything released |
+| 503 | `PAYMENT_PENDING` | Payment outcome not confirmed yet; stock and coupon stay held. Response has `Retry-After`. Retry with the **same** key |
 
 ## Shopper endpoints
 
@@ -78,9 +79,10 @@ Responses:
 | 404 | `CART_NOT_FOUND` |
 | 409 | `CART_EMPTY`, `INSUFFICIENT_STOCK` (details list every short line), `QUOTE_CHANGED`, `COUPON_IN_USE`, `COUPON_ALREADY_REDEEMED`, `CART_CHECKOUT_IN_PROGRESS` (different key while another attempt is paying), `CART_ALREADY_CHECKED_OUT` (different key after success; details contain `orderId`) |
 | 422 | `COUPON_INVALID`, `IDEMPOTENCY_KEY_REUSED` (same key, different cart/coupon/expected total) |
-| 502 | `PAYMENT_FAILED` |
+| 502 | `PAYMENT_FAILED` (provider confirmed no charge) |
+| 503 | `PAYMENT_PENDING` + `Retry-After: 5`: outcome unknown, everything held; retry with the same key, which looks the charge up and never charges twice |
 
-A failed checkout does **not** consume the key: the client may fix the problem and retry with the same key.
+A failed checkout does **not** consume the key: the client may fix the problem and retry with the same key. A completed checkout can be replayed for `IDEMPOTENCY_TTL_HOURS` (default 24). After that, the cart itself still prevents a second order (`CART_ALREADY_CHECKED_OUT` with the `orderId`).
 
 Order body:
 

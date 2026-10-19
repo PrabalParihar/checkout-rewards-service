@@ -10,7 +10,7 @@ The interesting part is behaviour under **retries and concurrency**. Checkout re
 
 ```bash
 npm install
-npm test          # 44 tests: unit, concurrency and HTTP-level races
+npm test          # 49 tests: unit, concurrency and HTTP-level races
 npm start         # http://127.0.0.1:3000
 ```
 
@@ -27,6 +27,8 @@ npm run demo      # replay, coupon race, last-unit race, report
 | `REWARD_EVERY_N_ORDERS` | `5` | *n*: every n-th successful order unlocks one coupon |
 | `DISCOUNT_PERCENT` | `10` | *x*: coupon discount, integer 1–100 |
 | `PAYMENT_LATENCY_MS` | `50` | Fake payment delay; makes concurrent checkouts really overlap |
+| `IDEMPOTENCY_TTL_HOURS` | `24` | How long a checkout can be replayed by its `Idempotency-Key` |
+| `MAINTENANCE_INTERVAL_MS` | `30000` | How often unconfirmed payments are settled and expired keys pruned |
 | `PORT` / `HOST` | `3000` / `127.0.0.1` | Listen address |
 
 ```bash
@@ -80,7 +82,8 @@ curl -s localhost:3000/admin/report
 - **Retry with the same key:** the same order comes back (200, `Idempotent-Replayed: true`). If the first attempt is still in flight, the retry waits for it and gets its result. Only one payment is attempted.
 - **Two carts racing for the last unit:** exactly one 201. The others get 409 `INSUFFICIENT_STOCK`.
 - **Two checkouts using one coupon at once:** one gets the discount. The other gets 409 `COUPON_IN_USE`.
-- **Payment declined or provider error:** stock, coupon and cart are all released, and the key can be retried.
+- **Payment declined:** stock, coupon and cart are all released, and the key can be retried.
+- **Payment provider times out:** the service asks the provider what happened instead of guessing. If it charged, the order is placed. If it never received the charge, everything is released. If it can't answer yet, everything stays held and the client gets 503 `PAYMENT_PENDING`; a retry with the same key (or the background pass) settles it. Nothing is ever charged twice.
 - **Concurrent coupon generation:** at most one coupon per milestone.
 
 ## Project layout
@@ -106,6 +109,6 @@ docs/API.md     endpoint reference
 scripts/demo.sh executable walkthrough
 ```
 
-## Limitations
+## Scope
 
-This runs as a single process with in-memory state, so a restart loses all data. Running more than one instance would split inventory, so don't. [DECISIONS.md §7](DECISIONS.md#7-evolving-to-multiple-instances-and-production-scale) describes the database-backed design for multiple instances. Deliberately deferred items are listed in §6.
+As the brief allows, state is in memory and the service runs as one process. [DECISIONS.md §7](DECISIONS.md#7-evolving-to-multiple-instances-and-production-scale) maps every invariant onto a database-backed, multi-instance design, and [§6](DECISIONS.md#6-scope-implemented-and-intentionally-out-of-scope) lists what is in and out of scope.
