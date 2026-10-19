@@ -2,6 +2,7 @@ import { CartService } from './carts.js';
 import { CatalogService } from './catalog.js';
 import { CheckoutService } from './checkout.js';
 import { CouponService } from './coupons.js';
+import { ReportService } from './report.js';
 import { FakePaymentGateway, type PaymentGateway } from './payment.js';
 import { Store } from './store.js';
 import type { Product } from './types.js';
@@ -30,6 +31,7 @@ export function createShop(opts: ShopOptions) {
     carts: new CartService(store),
     coupons,
     checkout: new CheckoutService(store, payment, coupons),
+    report: new ReportService(store, coupons),
   };
 }
 

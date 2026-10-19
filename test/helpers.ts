@@ -38,7 +38,7 @@ export const code = (expected: string) => (err: unknown) => {
 /**
  * A payment gateway the test controls: every charge stays pending until the
  * test settles it. This makes "request B arrives while A is paying"
- * deterministic instead of timing-dependent.
+ * deterministic instead of timing-dependent. `index` counts held charges only.
  */
 export class ManualPaymentGateway implements PaymentGateway {
   readonly calls: ChargeRequest[] = [];
